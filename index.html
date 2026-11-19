@@ -6,6 +6,7 @@
 <title>CSU/JU München – Orts- und Kreisverbände</title>
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://unpkg.com/@turf/turf@7/turf.min.js"></script>
 <style>
   html, body { margin: 0; height: 100%; font-family: system-ui, sans-serif; }
   #map { position: absolute; inset: 0; }
@@ -21,8 +22,15 @@
   #info table { border-collapse: collapse; width: 100%; }
   #info td { padding: 2px 4px; vertical-align: top; }
   #info td:first-child { color: #666; white-space: nowrap; }
-  #info .ov { font-weight: 600; font-size: 16px; }
   .hint { color: #666; font-size: 12px; }
+  .tt { border-collapse: collapse; }
+  .tt td { padding: 1px 4px; vertical-align: top; }
+  .tt td:first-child { color: #666; }
+  .kv-start td { border-top: 1px solid #ddd; padding-top: 3px; }
+  .kv-farbe { display: inline-block; width: 10px; height: 10px; }
+  #info .ov { font-size: 15px; }
+  #info a { color: #0039a6; }
+  .links { font-size: 12px; }
   .ov-label { background: none; border: none; box-shadow: none; font-size: 11px; font-weight: 600;
               color: #222; text-shadow: 0 0 3px #fff, 0 0 3px #fff; }
   .legend { background: #fff; padding: 6px 8px; border-radius: 6px; font-size: 12px; line-height: 18px;
@@ -46,7 +54,8 @@
 <script>
 // ---- Konfiguration -------------------------------------------------------
 const DATA = {
-  ov:  'data/ortsverbaende.geojson',        // Eigenschaften: ov, kv, stadtbezirke
+  csu: 'data/csu_ortsverbaende.geojson',    // ein Feature je CSU-OV: kv_nr, kv, kv_csu_url, kv_ju_url, ju, ju_url, nr, name, url, stadtbezirke
+  sb:  'data/stadtbezirke.geojson',         // nr, name
   ltw: 'data/landtagsstimmkreise.geojson',  // nr, name
   btw: 'data/bundestagswahlkreise.geojson', // nr, name
 };
@@ -75,6 +84,61 @@ function contains(feature, lng, lat) {
 }
 const finde = (fc, lat, lng) => fc ? fc.features.find(f => contains(f, lng, lat)) : undefined;
 
+// Anteile der Wahlkreise (fc) an einem Gebiet (Stichproben auf einem Raster)
+function anteile(feature, fc, n = 25) {
+  const [w, s, e, nn] = turf.bbox(feature), anz = new Map();
+  let summe = 0;
+  for (let i = 0; i < n; i++) for (let j = 0; j < n; j++) {
+    const lng = w + (i + .5) / n * (e - w), lat = s + (j + .5) / n * (nn - s);
+    if (!contains(feature, lng, lat)) continue;
+    summe++;
+    const wk = finde(fc, lat, lng);
+    if (wk) anz.set(wk, (anz.get(wk) || 0) + 1);
+  }
+  return [...anz].map(([wk, k]) => ({ wk, anteil: k / summe }))
+    .filter(x => x.anteil >= 0.05).sort((a, b) => b.anteil - a.anteil);
+}
+
+// ---- JU-Ortsverbände = Vereinigung ihrer CSU-OVs ---------------------------
+const vereinige = fs => fs.length === 1 ? fs[0] : turf.union(turf.featureCollection(fs));
+
+// Prüft, dass sich keine CSU-OVs überschneiden (Ausgabe in der Browser-Konsole)
+function pruefen(csuFlaechen) {
+  const boxen = csuFlaechen.map(f => turf.bbox(f));
+  csuFlaechen.forEach((f, i) => csuFlaechen.slice(i + 1).forEach((g, k) => {
+    const [a, b] = [boxen[i], boxen[i + 1 + k]];
+    if (a[0] > b[2] || b[0] > a[2] || a[1] > b[3] || b[1] > a[3]) return;
+    const x = turf.intersect(turf.featureCollection([f, g]));
+    if (x && turf.area(x) > 1000)
+      console.warn(`Überschneidung: ${f.properties.name} / ${g.properties.name} (${Math.round(turf.area(x))} m²)`);
+  }));
+}
+
+// ---- Texte ---------------------------------------------------------------
+const wkName = wk => `${wk.properties.nr} ${wk.properties.name}`;
+const kvText = kv => `${kv.name}, KV ${kv.nr}`;
+const ovText = (name, nr) => `${name}, OV ${nr ?? '?'}`;
+// JU-OV-Nummer = Nummern ihrer CSU-OVs (z. B. „27b, 27c, 27d“)
+const juNr = ju => ju.csu.map(f => f.properties.nr).filter(Boolean).join(', ') || null;
+const link = (text, url) => url ? `<a href="${url}" target="_blank" rel="noopener">${text}</a>` : text;
+function wahlkreisText(liste) {
+  if (!liste.length) return '–';
+  if (liste.length === 1) return wkName(liste[0].wk);
+  return liste.map(x => `${wkName(x.wk)} (${Math.round(x.anteil * 100)} %)`).join('<br>');
+}
+
+// Zeilen für einen CSU-OV; mitLinks: Namen als Links (nur im Panel – Tooltips sind nicht klickbar)
+function ovZeilen(f, mitLinks) {
+  const { kv, ju } = verband.get(f), csu = f.properties, l = mitLinks ? link : t => t;
+  const sb = (csu.stadtbezirke || []).map(nr => `${nr} ${sbName.get(nr) || ''}`).join('<br>');
+  return `
+    <tr><td>Kreisverband</td><td><i class="kv-farbe" style="background:${kvFarbe.get(kv)}"></i> <b>${kvText(kv)}</b>
+      ${mitLinks ? `<br><span class="links">${link('CSU', kv.csu_url)} · ${link('JU', kv.ju_url)}</span>` : ''}</td></tr>
+    <tr><td>JU-OV</td><td class="ov"><b>${l(ovText(ju.name, juNr(ju)), ju.url)}</b></td></tr>
+    <tr><td>CSU-OV</td><td><b>${l(ovText(csu.name, csu.nr), csu.url)}</b></td></tr>
+    <tr><td>Stadtbezirk</td><td>${sb}</td></tr>`;
+}
+
 // ---- Karte ---------------------------------------------------------------
 const map = L.map('map', { zoomControl: true }).setView([48.137, 11.575], 11);
 L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
@@ -85,29 +149,58 @@ L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
 map.createPane('overlays').style.zIndex = 450;
 map.getPane('overlays').style.pointerEvents = 'none';
 
-let daten = {}, ovLayer, auswahlLayer, marker;
-const kvFarbe = {};
-
-function farbeFuer(kv) {
-  if (!kv || kv.includes('?')) return UNBEKANNT;
-  if (!(kv in kvFarbe)) kvFarbe[kv] = KV_FARBEN[Object.keys(kvFarbe).length % KV_FARBEN.length];
-  return kvFarbe[kv];
-}
+let daten = {}, auswahlLayer, marker;
+const kvFarbe = new Map();  // KV-Objekt -> Farbe
+const verband = new Map();  // CSU-/JU-OV-Fläche -> { kv, ju }
+const sbName = new Map();   // Stadtbezirk-Nr -> Name
 
 const laden = url => fetch(url).then(r => { if (!r.ok) throw new Error(url + ': ' + r.status); return r.json(); });
+const namenLayer = (fs, text) => L.layerGroup(fs.map(f =>
+  L.marker(turf.pointOnFeature(f).geometry.coordinates.slice().reverse(), { opacity: 0, interactive: false })
+    .bindTooltip(text(f), { permanent: true, direction: 'center', className: 'ov-label' })));
 
-Promise.all([laden(DATA.ov), laden(DATA.ltw), laden(DATA.btw)]).then(([ov, ltw, btw]) => {
-  daten = { ov, ltw, btw };
-  // KV-Farben in fester Reihenfolge vergeben
-  [...new Set(ov.features.map(f => f.properties.kv))].sort((a, b) => a.localeCompare(b, 'de', { numeric: true })).forEach(farbeFuer);
+Promise.all([DATA.csu, DATA.sb, DATA.ltw, DATA.btw].map(laden)).then(([csu, sb, ltw, btw]) => {
+  sb.features.forEach(f => sbName.set(f.properties.nr, f.properties.name));
 
-  ovLayer = L.geoJSON(ov, {
-    style: f => ({ color: '#333', weight: 1, fillColor: farbeFuer(f.properties.kv), fillOpacity: 0.35 }),
+  // Kreisverbände und JU-OVs aus den Eigenschaften der CSU-OVs (Reihenfolge wie in der Datei)
+  const kvs = new Map(), jus = new Map();
+  csu.features.forEach(f => {
+    const p = f.properties;
+    if (!kvs.has(p.kv_nr)) {
+      kvs.set(p.kv_nr, { nr: p.kv_nr, name: p.kv, csu_url: p.kv_csu_url, ju_url: p.kv_ju_url });
+      kvFarbe.set(kvs.get(p.kv_nr), KV_FARBEN[(kvs.size - 1) % KV_FARBEN.length]);
+    }
+    const schluessel = `${p.kv_nr}|${p.ju}`;
+    if (!jus.has(schluessel)) jus.set(schluessel, { name: p.ju, url: p.ju_url, csu: [] });
+    jus.get(schluessel).csu.push(f);
+    verband.set(f, { kv: kvs.get(p.kv_nr), ju: jus.get(schluessel) });
+  });
+  const juFlaechen = [...jus.values()].map(ju => {
+    const u = vereinige(ju.csu.map(f => ({ ...f })));
+    verband.set(u, { kv: verband.get(ju.csu[0]).kv, ju });
+    return u;
+  });
+  pruefen(csu.features);
+  daten = { csu, ltw, btw };
+
+  const csuLayer = L.geoJSON(daten.csu, {
+    style: f => ({ color: '#555', weight: 0.8, fillOpacity: 0.4, fillColor: kvFarbe.get(verband.get(f).kv) || UNBEKANNT }),
     onEachFeature: (f, layer) => {
-      layer.bindTooltip(`${f.properties.ov} <span style="color:#666">(${f.properties.kv || 'KV ?'})</span>`, { sticky: true });
+      layer.bindTooltip(`<table class="tt">
+        ${ovZeilen(f, false)}
+        <tr class="kv-start"><td>Stimmkreis</td><td>${wahlkreisText(anteile(f, ltw))}</td></tr>
+        <tr><td>Bundestag</td><td>${wahlkreisText(anteile(f, btw))}</td></tr>
+      </table><div class="hint">Klick zeigt Links</div>`, { sticky: true });
     }
   }).addTo(map);
 
+  const juLayer = L.geoJSON(turf.featureCollection(juFlaechen), {
+    pane: 'overlays', interactive: false, style: { color: '#222', weight: 2.5, fill: false },
+  }).addTo(map);
+  const sbLayer = L.geoJSON(sb, {
+    pane: 'overlays', interactive: false,
+    style: { color: '#000', weight: 2, dashArray: '1 5', fill: false },
+  });
   const ltwLayer = L.geoJSON(ltw, {
     pane: 'overlays', interactive: false,
     style: { color: '#c00', weight: 3, dashArray: '8 6', fill: false },
@@ -116,13 +209,13 @@ Promise.all([laden(DATA.ov), laden(DATA.ltw), laden(DATA.btw)]).then(([ov, ltw, 
     pane: 'overlays', interactive: false,
     style: { color: '#0039a6', weight: 4, dashArray: '2 8', lineCap: 'round', fill: false },
   });
-  const ovNamen = L.layerGroup(ov.features.map(f =>
-    L.marker(L.geoJSON(f).getBounds().getCenter(), { opacity: 0, interactive: false })
-      .bindTooltip(f.properties.ov, { permanent: true, direction: 'center', className: 'ov-label' })));
 
   L.control.layers(null, {
-    'Ortsverbände': ovLayer,
-    'OV-Namen': ovNamen,
+    'CSU-Ortsverbände': csuLayer,
+    '<b>▬</b> JU-Ortsverbände': juLayer,
+    'JU-OV-Namen': namenLayer(juFlaechen, f => verband.get(f).ju.name),
+    'CSU-OV-Namen': namenLayer(csu.features, f => f.properties.name),
+    '<span style="color:#000">· · ·</span> Stadtbezirke': sbLayer,
     '<span style="color:#c00">▬ ▬</span> Landtagsstimmkreise 2023': ltwLayer,
     '<span style="color:#0039a6">• • •</span> Bundestagswahlkreise 2025': btwLayer,
   }, { collapsed: window.innerWidth < 600 }).addTo(map);
@@ -131,18 +224,18 @@ Promise.all([laden(DATA.ov), laden(DATA.ltw), laden(DATA.btw)]).then(([ov, ltw, 
   const legende = L.control({ position: 'bottomright' });
   legende.onAdd = () => {
     const d = L.DomUtil.create('div', 'legend');
-    d.innerHTML = Object.entries(kvFarbe).map(([kv, c]) => `<i style="background:${c}"></i>${kv}`).join('<br>') +
-      (ov.features.some(f => !f.properties.kv || f.properties.kv.includes('?'))
-        ? `<br><i style="background:${UNBEKANNT}"></i>KV noch offen` : '');
+    d.innerHTML = [...kvFarbe].map(([kv, c]) => `<i style="background:${c}"></i>${kvText(kv)}`).join('<br>') +
+      '<br><span class="hint">dicke Linie: JU-OV · dünne Linie: CSU-OV</span>';
     return d;
   };
   legende.addTo(map);
-  map.fitBounds(ovLayer.getBounds());
+  map.fitBounds(csuLayer.getBounds());
 
   // Position aus URL-Hash wiederherstellen (#48.15,11.56)
   const m = location.hash.match(/^#(-?[\d.]+),(-?[\d.]+)/);
   if (m) zeige(+m[1], +m[2], 'Link');
 }).catch(e => {
+  console.error(e);
   document.getElementById('info').innerHTML =
     `<b style="color:#c00">Daten konnten nicht geladen werden.</b><br><span class="hint">${e.message}<br>` +
     `Die Seite muss über einen Webserver geöffnet werden (nicht per Doppelklick als file://).</span>`;
@@ -150,7 +243,7 @@ Promise.all([laden(DATA.ov), laden(DATA.ltw), laden(DATA.btw)]).then(([ov, ltw, 
 
 // ---- Abfrage -------------------------------------------------------------
 function zeige(lat, lng, quelle) {
-  const ov = finde(daten.ov, lat, lng), ltw = finde(daten.ltw, lat, lng), btw = finde(daten.btw, lat, lng);
+  const ov = finde(daten.csu, lat, lng), ltw = finde(daten.ltw, lat, lng), btw = finde(daten.btw, lat, lng);
   if (marker) marker.setLatLng([lat, lng]); else marker = L.marker([lat, lng]).addTo(map);
   if (auswahlLayer) map.removeLayer(auswahlLayer);
   if (ov) auswahlLayer = L.geoJSON(ov, { style: { color: '#000', weight: 3, fill: false }, interactive: false }).addTo(map);
@@ -161,13 +254,10 @@ function zeige(lat, lng, quelle) {
     info.innerHTML = '<span class="hint">Dieser Punkt liegt außerhalb Münchens.</span>';
     return;
   }
-  const p = ov ? ov.properties : {};
   info.innerHTML = `<table>
-    <tr><td>Ortsverband</td><td class="ov">${ov ? p.ov : '–'}</td></tr>
-    <tr><td>Kreisverband</td><td><i style="display:inline-block;width:10px;height:10px;background:${farbeFuer(p.kv)}"></i> ${p.kv || '–'}</td></tr>
-    ${p.stadtbezirke ? `<tr><td>Stadtbezirk</td><td>${[].concat(p.stadtbezirke).join(', ')}</td></tr>` : ''}
-    <tr><td>Landtag</td><td>${ltw ? `Stimmkreis ${ltw.properties.nr} ${ltw.properties.name}` : '–'}</td></tr>
-    <tr><td>Bundestag</td><td>${btw ? `Wahlkreis ${btw.properties.nr} ${btw.properties.name}` : '–'}</td></tr>
+    ${ov ? ovZeilen(ov, true) : '<tr><td>CSU-OV</td><td>–</td></tr>'}
+    <tr class="kv-start"><td>Stimmkreis</td><td>${ltw ? wkName(ltw) : '–'}</td></tr>
+    <tr><td>Bundestag</td><td>${btw ? wkName(btw) : '–'}</td></tr>
   </table><div class="hint">${quelle}: ${lat.toFixed(5)}, ${lng.toFixed(5)}</div>`;
 }
 
